@@ -1,0 +1,221 @@
+#!/usr/bin/env python3
+"""git-stranded: scan a folder of git repos for work that could be lost.
+
+Part of Don't Git Stranded. Put this file on your PATH and run it as `git stranded`.
+
+Flags, per repo:
+  * UNPUSHED   commits on a local branch that are not on its upstream
+  * UNPUBLISHED branches with commits that exist on no remote at all
+                (no upstream, or the upstream was deleted)
+  * NO-REMOTE  repo has no remote configured
+  * STALE      uncommitted changes (incl. untracked files) older than N hours
+  * STASH      stash entries older than N hours
+
+Settings (later overrides earlier): built-in defaults < config file < env < CLI.
+  Config file: ~/.config/git-stranded/config.json, e.g.
+    {"root": "~/code", "stale_hours": 24, "max_depth": 3,
+     "exclude": ["node_modules", "archive"], "fetch": false}
+  Env: GIT_STRANDED_ROOT, GIT_STRANDED_STALE_HOURS, GIT_STRANDED_MAX_DEPTH
+
+Exit code: 0 = no issues, 1 = issues found, 2 = bad usage/config.
+Standard library only; needs `git` on PATH.
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+DEFAULTS = {
+    "root": "~/code",
+    "stale_hours": 24.0,
+    "max_depth": 3,
+    "exclude": ["node_modules", ".venv", "venv", "__pycache__", "Library", ".Trash"],
+    "fetch": False,
+}
+CONFIG_PATH = Path("~/.config/git-stranded/config.json").expanduser()
+
+
+def git(repo, *args, check=False):
+    """Run git in repo; return stdout (str). Returns '' on failure unless check."""
+    try:
+        p = subprocess.run(
+            # A repo's .git/config can set core.fsmonitor to any command; never run it while scanning.
+            ["git", "-c", "core.fsmonitor=false", "-C", str(repo), *args],
+            capture_output=True, text=True, timeout=60,
+            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0", "LC_ALL": "C"},
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        if check:
+            raise
+        return ""
+    if p.returncode != 0 and check:
+        raise RuntimeError(p.stderr.strip())
+    return p.stdout if p.returncode == 0 else ""
+
+
+def find_repos(root, max_depth, exclude):
+    """Yield repo working dirs under root (a '.git' dir or file marks a repo)."""
+    root = Path(root)
+    base_depth = len(root.parts)
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        depth = len(Path(dirpath).parts) - base_depth
+        if ".git" in dirnames or ".git" in filenames:
+            yield Path(dirpath)
+            dirnames[:] = []          # don't descend into a repo
+            continue
+        if depth >= max_depth:
+            dirnames[:] = []
+            continue
+        dirnames[:] = [d for d in dirnames if d not in exclude and not d.startswith(".")]
+
+
+def fmt_age(seconds):
+    h = seconds / 3600
+    return f"{h / 24:.1f}d" if h >= 48 else f"{h:.0f}h" if h >= 1 else f"{seconds / 60:.0f}m"
+
+
+def check_repo(repo, stale_secs, now):
+    """Return a list of (kind, message) issues for one repo."""
+    issues = []
+
+    # --- remotes ---
+    remotes = git(repo, "remote").split()
+    if not remotes:
+        issues.append(("NO-REMOTE", "no remote configured; nothing is backed up"))
+
+    # --- local branches: ahead of upstream / on no remote ---
+    fmt = "%(refname:short)\t%(upstream:short)\t%(upstream:track)"
+    for line in git(repo, "for-each-ref", f"--format={fmt}", "refs/heads").splitlines():
+        parts = line.split("\t")
+        branch, upstream, track = (parts + ["", "", ""])[:3]
+        if upstream:
+            if "gone" in track:
+                # Deleted upstream is only a risk if some commits exist on no remote (not e.g. a merged PR branch).
+                n = git(repo, "rev-list", "--count", f"refs/heads/{branch}", "--not", "--remotes").strip() if remotes else ""
+                if n and int(n) > 0:
+                    issues.append(("UNPUBLISHED", f"{branch}: upstream {upstream} was deleted; {n} commit(s) on no remote"))
+            elif "ahead" in track:
+                n = track.strip("[]").split("ahead ")[1].split(",")[0]
+                issues.append(("UNPUSHED", f"{branch}: {n} commit(s) ahead of {upstream}"))
+        elif remotes:
+            n = git(repo, "rev-list", "--count", f"refs/heads/{branch}", "--not", "--remotes").strip()
+            if n and int(n) > 0:
+                issues.append(("UNPUBLISHED", f"{branch}: {n} commit(s) not on any remote (no upstream)"))
+
+    # --- uncommitted changes, with age ---
+    out = git(repo, "status", "--porcelain=v1", "-z", "--untracked-files=all")
+    entries = [e for e in out.split("\0") if e]
+    paths, skip_next = [], False
+    for e in entries:
+        if skip_next:                  # rename/copy: second entry is the old path
+            skip_next = False
+            continue
+        status, path = e[:2], e[3:]
+        if "R" in status or "C" in status:
+            skip_next = True
+        paths.append(path)
+    if paths:
+        mtimes = []
+        for p in paths:
+            try:
+                mtimes.append(os.lstat(os.path.join(repo, p)).st_mtime)
+            except OSError:
+                pass                   # deleted file: no mtime
+        if not mtimes:                 # only deletions: fall back to index time
+            try:
+                mtimes.append((Path(repo) / ".git" / "index").stat().st_mtime)
+            except OSError:
+                mtimes.append(now)
+        oldest = now - min(mtimes)
+        newest = now - max(mtimes)
+        if oldest >= stale_secs:
+            issues.append((
+                "STALE",
+                f"{len(paths)} uncommitted file(s); oldest change {fmt_age(oldest)} ago, "
+                f"newest {fmt_age(newest)} ago",
+            ))
+
+    # --- stashes ---
+    stashes = git(repo, "stash", "list", "--format=%ct\t%gd: %gs").splitlines()
+    old = [s for s in stashes if s.split("\t")[0].isdigit() and now - int(s.split("\t")[0]) >= stale_secs]
+    if old:
+        issues.append(("STASH", f"{len(old)} stash(es) older than threshold (stashes are never pushed)"))
+
+    return issues
+
+
+def load_settings(argv):
+    ap = argparse.ArgumentParser(description="Find git work that could be lost.")
+    ap.add_argument("--root", help="folder containing your repos (default ~/code)")
+    ap.add_argument("--stale-hours", type=float, help="flag uncommitted changes older than this (default 24)")
+    ap.add_argument("--max-depth", type=int, help="how deep to search under root (default 3)")
+    ap.add_argument("--exclude", action="append", help="folder name to skip (repeatable)")
+    ap.add_argument("--fetch", action="store_true", default=None, help="git fetch first for fresher ahead/gone info")
+    ap.add_argument("--json", action="store_true", help="machine-readable output")
+    ap.add_argument("--notify", action="store_true", help="macOS notification when issues found")
+    ap.add_argument("--config", help=f"config file (default {CONFIG_PATH})")
+    a = ap.parse_args(argv)
+
+    s = dict(DEFAULTS)
+    cfg = Path(a.config).expanduser() if a.config else CONFIG_PATH
+    if cfg.exists():
+        try:
+            s.update(json.loads(cfg.read_text()))
+        except (OSError, ValueError) as e:
+            ap.error(f"cannot read config {cfg}: {e}")
+    elif a.config:
+        ap.error(f"config file not found: {cfg}")
+    env = os.environ
+    if env.get("GIT_STRANDED_ROOT"): s["root"] = env["GIT_STRANDED_ROOT"]
+    if env.get("GIT_STRANDED_STALE_HOURS"): s["stale_hours"] = float(env["GIT_STRANDED_STALE_HOURS"])
+    if env.get("GIT_STRANDED_MAX_DEPTH"): s["max_depth"] = int(env["GIT_STRANDED_MAX_DEPTH"])
+    if a.root: s["root"] = a.root
+    if a.stale_hours is not None: s["stale_hours"] = a.stale_hours
+    if a.max_depth is not None: s["max_depth"] = a.max_depth
+    if a.exclude: s["exclude"] = list(s["exclude"]) + a.exclude
+    if a.fetch: s["fetch"] = True
+    s["root"] = Path(s["root"]).expanduser()
+    return s, a
+
+
+def main(argv=None):
+    s, a = load_settings(argv if argv is not None else sys.argv[1:])
+    if not s["root"].is_dir():
+        print(f"git-stranded: root folder not found: {s['root']}", file=sys.stderr)
+        return 2
+
+    now = time.time()
+    stale_secs = s["stale_hours"] * 3600
+    results = []
+    for repo in sorted(find_repos(s["root"], s["max_depth"], set(s["exclude"]))):
+        if s["fetch"]:
+            git(repo, "fetch", "--all", "--quiet")
+        results.append((repo, check_repo(repo, stale_secs, now)))
+
+    flagged = [(r, i) for r, i in results if i]
+    if a.json:
+        print(json.dumps({
+            "root": str(s["root"]), "repos_scanned": len(results),
+            "issues": [{"repo": str(r), "kind": k, "message": m} for r, i in flagged for k, m in i],
+        }, indent=2))
+    else:
+        print(f"git-stranded: scanned {len(results)} repo(s) under {s['root']} "
+              f"(stale after {s['stale_hours']:g}h)")
+        for repo, issues in flagged:
+            print(f"\n{repo.relative_to(s['root']) if repo != s['root'] else repo}")
+            for kind, msg in issues:
+                print(f"  [{kind}] {msg}")
+        print("\nAll clear." if not flagged else f"\n{len(flagged)} repo(s) need attention.")
+
+    if flagged and a.notify and sys.platform == "darwin":
+        total = sum(len(i) for _, i in flagged)
+        msg = f"{total} issue(s) in {len(flagged)} repo(s)"
+        subprocess.run(["osascript", "-e", f'display notification "{msg}" with title "git-stranded"'])
+    return 1 if flagged else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
