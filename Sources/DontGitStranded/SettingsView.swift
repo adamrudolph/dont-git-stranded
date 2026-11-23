@@ -303,7 +303,9 @@ struct RepoToggleRow: View {
                     Text(repo.kind.rawValue).font(.caption2).padding(.horizontal, 5).padding(.vertical, 1)
                         .background(.quaternary, in: Capsule())
                 }
-                Text(relative).font(.caption.monospaced()).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                if relative != repo.name {   // only when it adds something, e.g. infra/terraform
+                    Text(relative).font(.caption.monospaced()).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                }
                 Spacer()
                 let n = state.visibleAlerts.filter { $0.repoPath == repo.path }.count
                 if n > 0 {

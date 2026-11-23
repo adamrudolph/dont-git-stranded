@@ -4,6 +4,12 @@ A macOS menu bar app that finds git work that exists only on your Mac before a l
 
 It watches the repositories you choose and alerts you when something has been sitting unbacked-up for longer than you're comfortable with. Each alert comes with a fix you can apply in one click.
 
+![First-run setup: choose a code folder and tick the repositories to watch](docs/screenshots/setup.png)
+
+| Repositories | Alerts | General |
+|---|---|---|
+| ![Repositories settings: opt-in list with nested worktrees](docs/screenshots/settings-repositories.png) | ![Alert settings: enable each check and set its threshold](docs/screenshots/settings-alerts.png) | ![General settings: code folder, scan interval, notifications, apps](docs/screenshots/settings-general.png) |
+
 ## What it flags
 
 | Alert | When | One-click fix |

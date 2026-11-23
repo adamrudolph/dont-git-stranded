@@ -27,6 +27,13 @@ enum Scanner {
         } else {
             found.removeAll { $0.kind == .worktree }
         }
+        // git records a worktree's main repo by its real path; point it at the path we found it under,
+        // so worktrees nest under their repo even when the code folder is reached through a symlink.
+        let byRealPath = Dictionary(found.map { (realPath($0.path), $0.path) }, uniquingKeysWith: { a, _ in a })
+        found = found.map { r in
+            guard r.kind == .worktree, let main = r.mainRepoPath, let local = byRealPath[realPath(main)], local != main else { return r }
+            return DiscoveredRepo(path: r.path, kind: r.kind, mainRepoPath: local)
+        }
         return found.sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
     }
 

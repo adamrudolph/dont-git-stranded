@@ -174,6 +174,8 @@ final class ScannerTests: XCTestCase {
         let with = Scanner.discover(root: code, maxDepth: 3, excludes: ["node_modules"], includeWorktrees: true)
         XCTAssertEqual(Set(with.map(\.name)), ["main", "main-wt"])
         XCTAssertEqual(with.first { $0.name == "main-wt" }?.kind, .worktree)
+        // Temp dirs live under /var -> /private/var; the worktree must still point at the path we found main under.
+        XCTAssertEqual(with.first { $0.name == "main-wt" }?.mainRepoPath, with.first { $0.name == "main" }?.path)
 
         // The worktree reports its own stale files; the no-remote alert is shared and reported once.
         let alerts = scan(worktrees: true)
